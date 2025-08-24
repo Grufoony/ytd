@@ -16,7 +16,7 @@ import yt_dlp  # pip install yt-dlp
 
 
 __author__ = "Grufoony"
-__version__ = "0.1"
+__version__ = "0.2"
 
 # --- Logging setup ---
 logging.basicConfig(
@@ -304,8 +304,11 @@ class YouTubeDownloaderApp:
                                     subprocess.run(
                                         ffmpeg_cmd,
                                         check=True,
-                                        stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
+                                        creationflags=subprocess.CREATE_NO_WINDOW
+                                        if os.name == "nt"
+                                        else 0,
                                     )
                                     logging.info(
                                         f"Converted {result_path} to {converted_path}"
@@ -378,7 +381,11 @@ class YouTubeDownloaderApp:
                 str(temp_mp3_path),
             ]
             subprocess.run(
-                ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                ffmpeg_cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             logging.info(f"Created temporary MP3 for Shazam: {temp_mp3_path}")
 
