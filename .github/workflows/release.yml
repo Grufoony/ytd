@@ -1,0 +1,146 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # allows manual trigger
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Setup FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          # Create a local ffmpeg directory and copy the binaries
+          mkdir -p ffmpeg
+          cp /usr/bin/ffmpeg ffmpeg/ffmpeg
+          cp /usr/bin/ffprobe ffmpeg/ffprobe
+
+      - name: Setup FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # Download and extract ffmpeg
+          mkdir ffmpeg
+          echo "Downloading FFmpeg..."
+          curl -L -o ffmpeg.zip "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          echo "Download completed. File size: $((Get-Item ffmpeg.zip).Length / 1MB) MB"
+          
+          # Extract the archive
+          echo "Extracting FFmpeg..."
+          Expand-Archive ffmpeg.zip -DestinationPath . -Force
+          
+          # Find and copy ffmpeg.exe to our ffmpeg directory
+          $extracted = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
+          echo "Extracted directory: $($extracted.FullName)"
+          $ffmpegExe = Join-Path $extracted.FullName "bin\ffmpeg.exe"
+          $ffprobeExe = Join-Path $extracted.FullName "bin\ffprobe.exe"
+          echo "FFmpeg source path: $ffmpegExe"
+          echo "FFprobe source path: $ffprobeExe"
+          echo "FFmpeg exists: $(Test-Path $ffmpegExe)"
+          echo "FFprobe exists: $(Test-Path $ffprobeExe)"
+          
+          if (Test-Path $ffmpegExe) {
+            Copy-Item $ffmpegExe "ffmpeg\ffmpeg.exe" -Force
+            echo "FFmpeg copied successfully"
+            echo "FFmpeg copied size: $((Get-Item 'ffmpeg\ffmpeg.exe').Length / 1MB) MB"
+            
+            if (Test-Path $ffprobeExe) {
+              Copy-Item $ffprobeExe "ffmpeg\ffprobe.exe" -Force
+              echo "FFprobe copied successfully"
+              echo "FFprobe copied size: $((Get-Item 'ffmpeg\ffprobe.exe').Length / 1MB) MB"
+            } else {
+              echo "WARNING: FFprobe not found, some features may not work"
+            }
+          } else {
+            echo "ERROR: FFmpeg executable not found at expected path"
+            echo "Available files in bin directory:"
+            Get-ChildItem (Join-Path $extracted.FullName "bin") | ForEach-Object { echo $_.Name }
+            exit 1
+          }
+          
+          # Clean up
+          Remove-Item ffmpeg.zip
+          Remove-Item $extracted.FullName -Recurse -Force
+        shell: pwsh
+
+      - name: Build executable (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --noconsole --onefile --add-data "ffmpeg/ffmpeg:." --add-data "ffmpeg/ffprobe:." app/app.py --name ytd
+
+      - name: Build executable (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --noconsole --onefile --add-data "ffmpeg\ffmpeg.exe:." --add-data "ffmpeg\ffprobe.exe:." --log-level=DEBUG app/app.py --name ytd
+        shell: pwsh
+
+      - name: Archive artifacts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir dist_out
+          tar -czvf dist_out/ytd-linux.tar.gz -C dist ytd
+
+      - name: Archive artifacts (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir dist_out
+          powershell Compress-Archive dist/ytd.exe dist_out/ytd-windows.zip
+        shell: pwsh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.os }}
+          path: dist_out/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist_all
+
+      - name: Extract version from app/app.py
+        id: get_version
+        run: |
+          VERSION=$(grep -Po "__version__\s*=\s*['\"]\K[\d.]+" app/app.py)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.get_version.outputs.version }}
+          name: "Release ${{ steps.get_version.outputs.version }}"
+          files: dist_all/**/*
+          update_existing: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}

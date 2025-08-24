@@ -1,0 +1,4 @@
+mutagen
+Requests
+shazamio
+yt_dlp
