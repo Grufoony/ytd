@@ -16,7 +16,7 @@ import yt_dlp  # pip install yt-dlp
 
 
 __author__ = "Grufoony"
-__version__ = "0.2"
+__version__ = "0.3"
 
 # --- Logging setup ---
 logging.basicConfig(
@@ -368,12 +368,15 @@ class YouTubeDownloaderApp:
         # Convert to temporary MP3 for Shazam to avoid header issues
         temp_mp3_path = downloaded_path.with_suffix(".temp.mp3")
         try:
-            # Convert to MP3 using ffmpeg
             ffmpeg_cmd = [
                 FFMPEG_PATH,
                 "-y",  # Overwrite output file
                 "-i",
                 str(downloaded_path),
+                "-ss",
+                "30",  # Start at 30 seconds
+                "-t",
+                "40",  # Duration: 40 seconds (30-70s)
                 "-acodec",
                 "mp3",
                 "-ab",
