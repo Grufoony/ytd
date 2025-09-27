@@ -5,11 +5,49 @@ on:
     branches:
       - main
   workflow_dispatch: # allows manual trigger
+  schedule:
+    - cron: '0 6 * * *' # runs daily at 6 AM UTC to check for new yt-dlp releases
 
 jobs:
+  check_ytdlp_release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check_release.outputs.should_build }}
+      ytdlp_version: ${{ steps.check_release.outputs.ytdlp_version }}
+    steps:
+      - name: Check for new yt-dlp release
+        id: check_release
+        run: |
+          # Skip check if manually triggered or pushed to main
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "${{ github.event_name }}" == "push" ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "Manual trigger or push - proceeding with build"
+            exit 0
+          fi
+          
+          # Get latest yt-dlp release
+          LATEST_YTDLP=$(curl -s https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest | jq -r .tag_name)
+          echo "Latest yt-dlp version: $LATEST_YTDLP"
+          echo "ytdlp_version=$LATEST_YTDLP" >> $GITHUB_OUTPUT
+          
+          # Get the last release tag from this repo
+          LAST_RELEASE=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r .tag_name 2>/dev/null || echo "")
+          echo "Last release tag: $LAST_RELEASE"
+          
+          # Check if we already built for this yt-dlp version
+          if [[ "$LAST_RELEASE" == *"$LATEST_YTDLP"* ]]; then
+            echo "Already built for yt-dlp $LATEST_YTDLP - skipping build"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "New yt-dlp version detected: $LATEST_YTDLP - proceeding with build"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
   build:
     name: Build ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    needs: check_ytdlp_release
+    if: needs.check_ytdlp_release.outputs.should_build == 'true'
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -27,6 +65,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # Upgrade yt-dlp to the latest version
+          pip install --upgrade yt-dlp
           pip install pyinstaller
 
       - name: Setup FFmpeg (Linux)
@@ -117,8 +157,9 @@ jobs:
           path: dist_out/*
 
   release:
-    needs: build
+    needs: [check_ytdlp_release, build]
     runs-on: ubuntu-latest
+    if: needs.check_ytdlp_release.outputs.should_build == 'true'
 
     steps:
       - name: Checkout repository
@@ -138,9 +179,18 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.get_version.outputs.version }}
-          name: "Release ${{ steps.get_version.outputs.version }}"
+          tag_name: v${{ steps.get_version.outputs.version }}-ytdlp${{ needs.check_ytdlp_release.outputs.ytdlp_version }}
+          name: "Release ${{ steps.get_version.outputs.version }} (yt-dlp ${{ needs.check_ytdlp_release.outputs.ytdlp_version }})"
+          body: |
+            YTD version ${{ steps.get_version.outputs.version }} built with yt-dlp ${{ needs.check_ytdlp_release.outputs.ytdlp_version }}
+            
+            ## Changes
+            - Updated to support yt-dlp ${{ needs.check_ytdlp_release.outputs.ytdlp_version }}
+            
+            ## Downloads
+            - **ytd-linux.tar.gz**: Linux executable
+            - **ytd-windows.zip**: Windows executable
           files: dist_all/**/*
-          update_existing: true
+          update_existing: false
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
