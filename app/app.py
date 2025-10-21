@@ -16,7 +16,7 @@ import yt_dlp  # pip install yt-dlp
 
 
 __author__ = "Grufoony"
-__version__ = "0.3"
+__version__ = "0.4"
 
 # --- Logging setup ---
 logging.basicConfig(
@@ -93,7 +93,6 @@ OUTTMLP_PLAYLIST = str(out_dir / "%(playlist_title)s/%(id)s.%(ext)s")
 
 YT_OPTIONS = {
     "format": "bestaudio[ext=m4a]",
-    "ignoreerrors": True,
     "addmetadata": True,
     "postprocessors": [{"key": "FFmpegMetadata"}],
     "ffmpeg_location": FFMPEG_PATH if FFMPEG_PATH != "ffmpeg" else None,
@@ -270,8 +269,8 @@ class YouTubeDownloaderApp:
                     info = ydl.extract_info(url_local, download=True)
             except Exception as e:
                 error_occurred = True
-                finish_bar(False, error_msg=f"Download Error: {e}")
-                messagebox.showerror("Download Error", f"Error downloading video: {e}")
+                error_str = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
+                finish_bar(False, error_msg=error_str)
                 return
 
             entries = (
@@ -345,10 +344,9 @@ class YouTubeDownloaderApp:
         # video_id = entry.get("id")
         downloaded_path = Path(str(ydl.prepare_filename(entry)))
         if not downloaded_path.exists():
-            logging.error(
+            raise Exception(
                 f"Expected file {downloaded_path} not found, skipping tagging."
             )
-            return
 
         uploader = entry.get("uploader", "Unknown").replace("/", "_")
         raw_title = entry.get("title", "Unknown").replace("/", "_")
