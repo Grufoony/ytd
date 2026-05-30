@@ -160,6 +160,16 @@ class YouTubeDownloaderApp:
 
         self.active_downloads = {}  # url_id: {label, progress, style, file_label}
 
+    def _run_on_ui_thread(self, callback):
+        """Run Tkinter operations safely on the main thread."""
+        try:
+            if not self.root.winfo_exists():
+                return
+            self.root.after(0, callback)
+        except tk.TclError:
+            # Window was likely destroyed while a worker thread was finishing.
+            return
+
     def download_url(self):
         url = self.url_entry.get().strip()
         # Simple URL validation (http/https and basic structure) to avoid misscopying
@@ -211,40 +221,46 @@ class YouTubeDownloaderApp:
             "file_label": None,
         }
 
-        def update_progress(val, maxval=100):
-            self.downloads_frame.after(
-                0, lambda: progress.config(maximum=maxval, value=val)
-            )
+        # Read Tkinter variables on UI thread before spawning background work.
+        allow_playlist = self.allow_playlist.get()
+        selected_format = self.format_var.get()
 
-        def set_bar_color(color):
-            style.configure(style_name, background=color)
+        def update_progress(val, maxval=100):
+            self._run_on_ui_thread(lambda: progress.config(maximum=maxval, value=val))
 
         def finish_bar(success, filename=None, error_msg=None):
-            if success:
-                set_bar_color("#4BB543")  # green
-            else:
-                set_bar_color("#FF3333")  # red
-            update_progress(100)
-            # Show filename or error to the right of the progress bar once progress is complete
-            display_text = error_msg if error_msg else filename
-            if display_text:
-                file_label = ttk.Label(
-                    self.downloads_frame,
-                    text=display_text,
-                    foreground="#FF3333" if error_msg else None,
-                )
-                file_label.grid(row=row, column=2, sticky="w", padx=5)
-                self.active_downloads[url_id]["file_label"] = file_label
+            def _finish_ui():
+                try:
+                    if not self.downloads_frame.winfo_exists():
+                        return
+                    if success:
+                        style.configure(style_name, background="#4BB543")  # green
+                    else:
+                        style.configure(style_name, background="#FF3333")  # red
+                    progress.config(maximum=100, value=100)
+                    # Show filename or error to the right of progress bar when complete.
+                    display_text = error_msg if error_msg else filename
+                    if display_text:
+                        file_label = ttk.Label(
+                            self.downloads_frame,
+                            text=display_text,
+                            foreground="#FF3333" if error_msg else None,
+                        )
+                        file_label.grid(row=row, column=2, sticky="w", padx=5)
+                        self.active_downloads[url_id]["file_label"] = file_label
+                except tk.TclError:
+                    return
+
+            self._run_on_ui_thread(_finish_ui)
 
         def job(url):
             update_progress(5)
-            if not self.allow_playlist.get():
+            if not allow_playlist:
                 url_local = url.split("&list=")[0]  # strip playlists
             else:
                 url_local = url
 
             error_occurred = False
-            selected_format = self.format_var.get()
 
             def hook(d):
                 if d["status"] == "downloading":
