@@ -7,16 +7,20 @@ import requests
 import subprocess
 import sys
 import threading
-import tkinter as tk
-from tkinter import ttk, messagebox
+
+from PySide6.QtCore import Qt, Signal, QObject
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QLineEdit,
+    QPushButton, QCheckBox, QComboBox, QScrollArea, QVBoxLayout,
+    QHBoxLayout, QGridLayout, QFrame, QMessageBox
+)
 
 from mutagen.mp4 import MP4, MP4Cover
 from shazamio import Shazam
-import yt_dlp  # pip install yt-dlp
-
+import yt_dlp
 
 __author__ = "Grufoony"
-__version__ = "0.4"
+__version__ = "0.5 (PySide6)"
 
 # --- Logging setup ---
 logging.basicConfig(
@@ -24,62 +28,42 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 # --- FFmpeg path detection for PyInstaller ---
 def get_ffmpeg_path():
-    """Get the path to ffmpeg executable, handling PyInstaller bundling."""
     if getattr(sys, "frozen", False):
-        # Running as PyInstaller bundle
         bundle_dir = sys._MEIPASS
-        if os.name == "nt":  # Windows
-            ffmpeg_path = Path(bundle_dir) / "ffmpeg.exe"
-        else:  # Linux/Mac
-            ffmpeg_path = Path(bundle_dir) / "ffmpeg"
-
-        if ffmpeg_path.exists():
-            return ffmpeg_path.as_posix()
-        logging.warning(f"FFmpeg not found in bundle at {ffmpeg_path}")
-        return "ffmpeg"  # Fallback to system ffmpeg
-    else:
-        # Running in development
-        return "ffmpeg"
+        p = Path(bundle_dir) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+        if p.exists():
+            return p.as_posix()
+        logging.warning(f"FFmpeg not found in bundle at {p}")
+    return "ffmpeg"
 
 
 def get_ffprobe_path():
-    """Get the path to ffprobe executable, handling PyInstaller bundling."""
     if getattr(sys, "frozen", False):
-        # Running as PyInstaller bundle
         bundle_dir = sys._MEIPASS
-        if os.name == "nt":  # Windows
-            ffprobe_path = Path(bundle_dir) / "ffprobe.exe"
-        else:  # Linux/Mac
-            ffprobe_path = Path(bundle_dir) / "ffprobe"
-
-        if ffprobe_path.exists():
-            return ffprobe_path.as_posix()
-        logging.warning(f"FFprobe not found in bundle at {ffprobe_path}")
-        return "ffprobe"  # Fallback to system ffprobe
-    else:
-        # Running in development
-        return "ffprobe"
+        p = Path(bundle_dir) / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
+        if p.exists():
+            return p.as_posix()
+        logging.warning(f"FFprobe not found in bundle at {p}")
+    return "ffprobe"
 
 
 FFMPEG_PATH = get_ffmpeg_path()
 FFPROBE_PATH = get_ffprobe_path()
-logging.info(f"Using FFmpeg at: {FFMPEG_PATH}")
+logging.info(f"Using FFmpeg at:  {FFMPEG_PATH}")
 logging.info(f"Using FFprobe at: {FFPROBE_PATH}")
 
-# --- Configure pydub to use our ffmpeg ---
 try:
     from pydub import AudioSegment
-
-    # Set ffmpeg path for pydub
     if FFMPEG_PATH != "ffmpeg" and Path(FFMPEG_PATH).exists():
         AudioSegment.converter = FFMPEG_PATH
         AudioSegment.ffmpeg = FFMPEG_PATH
         AudioSegment.ffprobe = FFPROBE_PATH
-        logging.info(f"Configured pydub to use FFmpeg at: {FFMPEG_PATH}")
-        logging.info(f"Configured pydub to use FFprobe at: {FFPROBE_PATH}")
+        logging.info("Configured pydub to use bundled FFmpeg/FFprobe.")
 except ImportError:
     logging.warning("pydub not available")
 
@@ -91,278 +75,392 @@ out_dir.mkdir(exist_ok=True)
 OUTTMLP = str(out_dir / "%(id)s.%(ext)s")
 OUTTMLP_PLAYLIST = str(out_dir / "%(playlist_title)s/%(id)s.%(ext)s")
 
-YT_OPTIONS = {
+YT_OPTIONS_BASE = {
     "format": "bestaudio[ext=m4a]",
     "addmetadata": True,
     "postprocessors": [{"key": "FFmpegMetadata"}],
     "ffmpeg_location": FFMPEG_PATH if FFMPEG_PATH != "ffmpeg" else None,
-    # "outtmpl": will be set after
 }
 
-# Initialize ShazamIO
 shazam = Shazam()
 
 
-# --- Helper to run async Shazam recognition from sync code ---
 def recognize_track(file_path: str) -> dict:
     return asyncio.run(shazam.recognize(file_path))
 
 
-# --- Tkinter GUI ---
-class YouTubeDownloaderApp:
-    def __init__(self, root):
-        self.root = root
-        root.title(f"YTD v{__version__}")
-        root.geometry("700x500")
+# ---------------------------------------------------------------------------
+# Communication Signals for Thread-safety
+# ---------------------------------------------------------------------------
+class WorkerSignals(QObject):
+    progress_updated = Signal(dict, int, int)  # row_dict, value, maximum
+    label_updated = Signal(dict, str)          # row_dict, text
+    row_finished = Signal(dict, bool, str)     # row_dict, success, message
 
-        self.allow_playlist = tk.BooleanVar(value=False)
 
-        # URL entry
-        self.url_label = ttk.Label(root, text="Insert video URL:")
-        self.url_label.pack(pady=5)
+# ---------------------------------------------------------------------------
+# Custom Progress Bar for PySide
+# ---------------------------------------------------------------------------
+class SimpleProgressBar(QFrame):
+    """A clean, styled color block acting as a progress bar."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setFixedHeight(12)
+        self.setFixedWidth(250)
+        self.setStyleSheet("background-color: #e0e0e0; border-radius: 4px;")
+        
+        self.fill = QFrame(self)
+        self.fill.setGeometry(0, 0, 0, 12)
+        self.set_color("#3385ff")
+        
+        self._max = 100
+        self._val = 0
 
-        self.url_entry = ttk.Entry(root, width=80)
-        self.url_entry.pack(pady=5)
+    def set_color(self, hex_color: str):
+        self.fill.setStyleSheet(f"background-color: {hex_color}; border-radius: 4px;")
 
-        # Format selection dropdown (Combobox)
-        format_frame = ttk.Frame(root)
-        format_frame.pack(pady=5)
+    def set_value(self, value: int, maximum: int = 100):
+        self._max = max(1, maximum)
+        self._val = max(0, min(value, self._max))
+        
+        # Calculate proportional width
+        pct = self._val / self._max
+        new_width = int(self.width() * pct)
+        self.fill.setGeometry(0, 0, new_width, 12)
 
-        self.playlist_check = ttk.Checkbutton(
-            format_frame,
-            text="Download Playlist",
-            variable=self.allow_playlist,
+
+# ---------------------------------------------------------------------------
+# Main application
+# ---------------------------------------------------------------------------
+class YouTubeDownloaderApp(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"YTD v{__version__}")
+        self.resize(860, 560)
+        self.setMinimumSize(640, 400)
+
+        self._row_count = 0
+        self._row_lock = threading.Lock()
+        
+        # Instantiate thread signals
+        self.signals = WorkerSignals()
+        self.signals.progress_updated.connect(self._handle_progress_update)
+        self.signals.label_updated.connect(self._handle_label_update)
+        self.signals.row_finished.connect(self._handle_row_finish)
+
+        # Main Layout Setup
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(12, 10, 12, 6)
+        main_layout.setSpacing(6)
+
+        # --- URL Bar ---
+        url_frame = QWidget()
+        url_layout = QHBoxLayout(url_frame)
+        url_layout.setContentsMargins(0, 0, 0, 0)
+        
+        url_layout.addWidget(QLabel("Video / Playlist URL:"))
+        self.url_entry = QLineEdit()
+        self.url_entry.returnPressed.connect(self.download_url)
+        url_layout.addWidget(self.url_entry, stretch=1)
+        
+        main_layout.addWidget(url_frame)
+
+        # --- Controls ---
+        ctrl_frame = QWidget()
+        ctrl_layout = QHBoxLayout(ctrl_frame)
+        ctrl_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.allow_playlist_cb = QCheckBox("Download Playlist")
+        ctrl_layout.addWidget(self.allow_playlist_cb)
+
+        ctrl_layout.addSpacing(16)
+        ctrl_layout.addWidget(QLabel("Format:"))
+        
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["m4a", "mp3", "flac", "wav"])
+        self.format_combo.setFixedWidth(75)
+        ctrl_layout.addWidget(self.format_combo)
+
+        ctrl_layout.addSpacing(16)
+        download_btn = QPushButton("Download")
+        download_btn.clicked.connect(self.download_url)
+        ctrl_layout.addWidget(download_btn)
+        
+        ctrl_layout.addStretch()
+        main_layout.addWidget(ctrl_frame)
+
+        # --- Column Headers ---
+        hdr_frame = QWidget()
+        hdr_layout = QGridLayout(hdr_frame)
+        hdr_layout.setContentsMargins(5, 4, 5, 4)
+        
+        headers = ["Title / ID", "Progress", "Result"]
+        alignments = [Qt.AlignLeft, Qt.AlignLeft, Qt.AlignLeft]
+        
+        for col, (text, align) in enumerate(zip(headers, alignments)):
+            lbl = QLabel(text)
+            lbl.setStyleSheet("color: #888;")
+            hdr_layout.addWidget(lbl, 0, col, align)
+            
+        hdr_layout.setColumnStretch(0, 2)
+        hdr_layout.setColumnStretch(1, 3)
+        hdr_layout.setColumnStretch(2, 3)
+        main_layout.addWidget(hdr_frame)
+
+        # Divider Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        sep.setStyleSheet("color: #ccc;")
+        main_layout.addWidget(sep)
+
+        # --- Scrollable Area for Content Rows ---
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.NoFrame)
+        
+        self.scroll_content = QWidget()
+        self.scroll_layout = QGridLayout(self.scroll_content)
+        self.scroll_layout.setContentsMargins(5, 2, 5, 2)
+        self.scroll_layout.setAlignment(Qt.AlignTop)
+        
+        self.scroll_layout.setColumnStretch(0, 2)
+        self.scroll_layout.setColumnStretch(1, 3)
+        self.scroll_layout.setColumnStretch(2, 3)
+        
+        self.scroll_area.setWidget(self.scroll_content)
+        main_layout.addWidget(self.scroll_area, stretch=1)
+
+    # -----------------------------------------------------------------------
+    # Signal Event Handlers (Executed safely on the UI Main Thread)
+    # -----------------------------------------------------------------------
+    def _handle_progress_update(self, row: dict, value: int, maximum: int):
+        if "progress" in row:
+            row["progress"].set_value(value, maximum)
+
+    def _handle_label_update(self, row: dict, text: str):
+        if "label" in row:
+            row["label"].setText(text[:50])
+
+    def _handle_row_finish(self, row: dict, success: bool, text: str):
+        if "progress" in row:
+            color = "#4BB543" if success else "#FF3333"
+            row["progress"].set_color(color)
+            row["progress"].set_value(100, 100)
+        if "result_label" in row:
+            row["result_label"].setText(text[:80])
+            if not success:
+                row["result_label"].setStyleSheet("color: #FF3333;")
+
+    # -----------------------------------------------------------------------
+    # UI Row Management
+    # -----------------------------------------------------------------------
+    def _add_row(self, title: str) -> dict:
+        """Appends one download row to the grid view layout. Must be main thread."""
+        with self._row_lock:
+            row_idx = self._row_count
+            self._row_count += 1
+
+        lbl = QLabel(title[:50])
+        self.scroll_layout.addWidget(lbl, row_idx, 0, Qt.AlignLeft | Qt.AlignVCenter)
+
+        pb = SimpleProgressBar()
+        self.scroll_layout.addWidget(pb, row_idx, 1, Qt.AlignLeft | Qt.AlignVCenter)
+
+        res = QLabel("")
+        self.scroll_layout.addWidget(res, row_idx, 2, Qt.AlignLeft | Qt.AlignVCenter)
+
+        # Force scroll area to shift down to see the latest item
+        self.scroll_area.verticalScrollBar().setValue(
+            self.scroll_area.verticalScrollBar().maximum()
         )
-        self.playlist_check.pack(side="left")
 
-        self.format_var = tk.StringVar(value="m4a")
-        self.format_label = ttk.Label(format_frame, text="Format:")
-        self.format_label.pack(side="left", padx=(10, 2))
-        self.format_combo = ttk.Combobox(
-            format_frame,
-            textvariable=self.format_var,
-            values=["m4a", "mp3", "flac", "wav"],
-            state="readonly",
-            width=6,
-        )
-        self.format_combo.pack(side="left")
-        self.format_combo.configure(justify="center")
+        return {
+            "label": lbl,
+            "progress": pb,
+            "result_label": res,
+        }
 
-        # Buttons
-        self.download_button = ttk.Button(
-            root, text="Download", command=self.download_url
-        )
-        self.download_button.pack(pady=5)
+    def _make_row_from_thread(self, title: str) -> dict:
+        """Asks UI main thread to make a row and blocks safely till generated."""
+        row = {}
+        ready = threading.Event()
 
-        # Download list frame
-        self.downloads_frame = ttk.Frame(root)
-        self.downloads_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        def _do():
+            row.update(self._add_row(title))
+            ready.set()
 
-        self.active_downloads = {}  # url_id: {label, progress, style, file_label}
+        # Simple cross-thread safety fallback hook technique
+        # Using a single-shot timer invocation to fire up UI generation logic 
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, _do)
+        ready.wait(timeout=10.0)
+        return row
 
-    def _run_on_ui_thread(self, callback):
-        """Run Tkinter operations safely on the main thread."""
-        try:
-            if not self.root.winfo_exists():
-                return
-            self.root.after(0, callback)
-        except tk.TclError:
-            # Window was likely destroyed while a worker thread was finishing.
-            return
-
+    # -----------------------------------------------------------------------
+    # Public Execution Entrypoints
+    # -----------------------------------------------------------------------
     def download_url(self):
-        url = self.url_entry.get().strip()
-        # Simple URL validation (http/https and basic structure) to avoid misscopying
+        url = self.url_entry.text().strip()
         url_pattern = re.compile(
             r"^(https?://)?([\w.-]+)\.([a-zA-Z]{2,})(:[0-9]+)?(/\S*)?$"
         )
         if not url or not url_pattern.match(url):
-            messagebox.showwarning("Input Error", "Please enter a valid video URL.")
-            self.url_entry.delete(0, tk.END)
+            QMessageBox.warning(self, "Input Error", "Please enter a valid video URL.")
+            self.url_entry.clear()
             return
 
-        # Clear the URL entry field immediately so user can enter another
-        self.url_entry.delete(0, tk.END)
+        self.url_entry.clear()
 
-        # Strip URL for display: get part after '?v=' and before '&list='
-        def get_url_id(url):
-            v_idx = url.find("?v=")
-            if v_idx == -1:
-                v_idx = url.find("v=")
-                if v_idx == -1:
-                    return url
-                v_idx += 2
-            else:
-                v_idx += 3
-            end_idx = url.find("&list=", v_idx)
-            if end_idx == -1:
-                return url[v_idx:]
-            return url[v_idx:end_idx]
+        m = re.search(r"[?&]v=([^&]+)", url)
+        display_id = m.group(1) if m else url.split("/")[-1].split("?")[0]
 
-        url_id = get_url_id(url)
+        # Generate structural UI tracking components right away
+        placeholder = self._add_row(display_id)
 
-        # Add to downloads frame
-        row = len(self.active_downloads)
-        label = ttk.Label(self.downloads_frame, text=url_id)
-        label.grid(row=row, column=0, sticky="w", padx=5, pady=2)
-        style_name = f"bar{row}.Horizontal.TProgressbar"
-        style = ttk.Style()
-        style.theme_use("default")
-        style.configure(style_name, background="#3385ff")
-        progress = ttk.Progressbar(
-            self.downloads_frame, length=300, mode="determinate", style=style_name
-        )
-        progress.grid(row=row, column=1, sticky="ew", padx=5, pady=2)
-        progress["value"] = 0
-        self.active_downloads[url_id] = {
-            "label": label,
-            "progress": progress,
-            "style": style_name,
-            "file_label": None,
-        }
+        allow_playlist = self.allow_playlist_cb.isChecked()
+        selected_format = self.format_combo.currentText()
 
-        # Read Tkinter variables on UI thread before spawning background work.
-        allow_playlist = self.allow_playlist.get()
-        selected_format = self.format_var.get()
+        threading.Thread(
+            target=self._download_job,
+            args=(url, allow_playlist, selected_format, placeholder),
+            daemon=True,
+        ).start()
 
-        def update_progress(val, maxval=100):
-            self._run_on_ui_thread(lambda: progress.config(maximum=maxval, value=val))
+    # -----------------------------------------------------------------------
+    # Background Worker Procedures
+    # -----------------------------------------------------------------------
+    def _download_job(self, url: str, allow_playlist: bool, selected_format: str, placeholder: dict):
+        if not allow_playlist:
+            url = url.split("&list=")[0]
 
-        def finish_bar(success, filename=None, error_msg=None):
-            def _finish_ui():
-                try:
-                    if not self.downloads_frame.winfo_exists():
-                        return
-                    if success:
-                        style.configure(style_name, background="#4BB543")  # green
-                    else:
-                        style.configure(style_name, background="#FF3333")  # red
-                    progress.config(maximum=100, value=100)
-                    # Show filename or error to the right of progress bar when complete.
-                    display_text = error_msg if error_msg else filename
-                    if display_text:
-                        file_label = ttk.Label(
-                            self.downloads_frame,
-                            text=display_text,
-                            foreground="#FF3333" if error_msg else None,
-                        )
-                        file_label.grid(row=row, column=2, sticky="w", padx=5)
-                        self.active_downloads[url_id]["file_label"] = file_label
-                except tk.TclError:
+        is_playlist_url = allow_playlist and ("list=" in url or "/playlist" in url)
+
+        if is_playlist_url:
+            info_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "extract_flat": "in_playlist",
+                "ffmpeg_location": FFMPEG_PATH if FFMPEG_PATH != "ffmpeg" else None,
+            }
+            try:
+                with yt_dlp.YoutubeDL(info_opts) as ydl:
+                    meta = ydl.extract_info(url, download=False)
+            except Exception as exc:
+                clean_err = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))[:80]
+                self.signals.row_finished.emit(placeholder, False, clean_err)
+                return
+
+            if not meta:
+                self.signals.row_finished.emit(placeholder, False, "Could not fetch playlist info")
+                return
+
+            raw_entries = meta.get("entries") or []
+            entries = [e for e in raw_entries if e]
+
+            if not entries:
+                entries = [meta]
+
+            title0 = entries[0].get("title") or entries[0].get("id") or "Unknown"
+            self.signals.label_updated.emit(placeholder, title0)
+            rows = [placeholder]
+
+            for entry in entries[1:]:
+                title = entry.get("title") or entry.get("id") or "Unknown"
+                rows.append(self._make_row_from_thread(title))
+        else:
+            entries = [{"webpage_url": url, "id": ""}]
+            rows = [placeholder]
+
+        for entry, row in zip(entries, rows):
+            self._download_single(entry, row, selected_format, is_playlist_url)
+
+    def _download_single(self, entry: dict, row: dict, selected_format: str, is_playlist: bool):
+        self.signals.progress_updated.emit(row, 5, 100)
+
+        video_url = entry.get("webpage_url") or entry.get("url") or ""
+        video_id = entry.get("id", "")
+        if not video_url.startswith("http") and video_id:
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+        if not video_url:
+            self.signals.row_finished.emit(row, False, "No URL found")
+            return
+
+        def hook(d):
+            if d["status"] == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate")
+                downloaded = d.get("downloaded_bytes", 0)
+                if total:
+                    pct = max(10, min(89, int(downloaded / total * 80) + 10))
+                    self.signals.progress_updated.emit(row, pct, 100)
+                actual_title = d.get("info_dict", {}).get("title", "")
+                if actual_title:
+                    self.signals.label_updated.emit(row, actual_title)
+            elif d["status"] == "finished":
+                self.signals.progress_updated.emit(row, 90, 100)
+
+        yt_opts = YT_OPTIONS_BASE.copy()
+        yt_opts["progress_hooks"] = [hook]
+        yt_opts["outtmpl"] = OUTTMLP_PLAYLIST if is_playlist else OUTTMLP
+
+        try:
+            self.signals.progress_updated.emit(row, 10, 100)
+            with yt_dlp.YoutubeDL(yt_opts) as ydl:
+                dl_info = ydl.extract_info(video_url, download=True)
+                dl_entries = (
+                    [e for e in dl_info.get("entries", []) if e]
+                    if "entries" in dl_info else [dl_info]
+                )
+                prepared_paths = [Path(ydl.prepare_filename(e)) for e in dl_entries]
+        except Exception as exc:
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
+            logging.error(f"yt-dlp error: {clean}")
+            self.signals.row_finished.emit(row, False, clean[:80])
+            return
+
+        final_name = None
+        for dl_entry, file_path in zip(dl_entries, prepared_paths):
+            actual_title = dl_entry.get("title", "")
+            if actual_title:
+                self.signals.label_updated.emit(row, actual_title)
+
+            try:
+                result_path = self._process_entry(
+                    dl_entry, file_path,
+                    lambda v: self.signals.progress_updated.emit(row, v, 100)
+                )
+                if result_path is None:
+                    self.signals.row_finished.emit(row, False, "Rename failed")
                     return
 
-            self._run_on_ui_thread(_finish_ui)
+                if selected_format != "m4a":
+                    converted = result_path.with_suffix(f".{selected_format}")
+                    subprocess.run(
+                        [FFMPEG_PATH, "-y", "-i", str(result_path), str(converted)],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=CREATE_NO_WINDOW,
+                    )
+                    result_path.unlink(missing_ok=True)
+                    final_name = converted.stem
+                else:
+                    final_name = result_path.stem
 
-        def job(url):
-            update_progress(5)
-            if not allow_playlist:
-                url_local = url.split("&list=")[0]  # strip playlists
-            else:
-                url_local = url
-
-            error_occurred = False
-
-            def hook(d):
-                if d["status"] == "downloading":
-                    total = d.get("total_bytes") or d.get("total_bytes_estimate")
-                    downloaded = d.get("downloaded_bytes", 0)
-                    if total:
-                        percent = int(downloaded / total * 100)
-                        update_progress(percent)
-                elif d["status"] == "finished":
-                    update_progress(90)
-
-            yt_options = YT_OPTIONS.copy()
-            yt_options["progress_hooks"] = [hook]
-            yt_options["outtmpl"] = (
-                OUTTMLP_PLAYLIST if "&list=" in url_local else OUTTMLP
-            )
-            yt_options["format"] = "bestaudio[ext=m4a]"
-
-            try:
-                update_progress(10)
-                with yt_dlp.YoutubeDL(yt_options) as ydl:
-                    info = ydl.extract_info(url_local, download=True)
-            except Exception as e:
-                error_occurred = True
-                error_str = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
-                finish_bar(False, error_msg=error_str)
+            except Exception as exc:
+                logging.error(f"Processing error: {exc}")
+                self.signals.row_finished.emit(row, False, f"Error: {exc}"[:80])
                 return
 
-            entries = (
-                [e for e in info.get("entries", []) if e]
-                if "entries" in info
-                else [info]
-            )
+        self.signals.row_finished.emit(row, True, final_name or "Done")
 
-            final_filename = None
-            try:
-                for entry in entries:
-                    update_progress(90)
-                    try:
-                        result_path = self.process_entry(entry, ydl, update_progress)
-                        if result_path:
-                            # If format is not m4a, convert using ffmpeg after tagging
-                            if selected_format != "m4a":
-                                converted_path = result_path.with_suffix(
-                                    f".{selected_format}"
-                                )
-
-                                ffmpeg_cmd = [
-                                    FFMPEG_PATH,
-                                    "-y",
-                                    "-i",
-                                    str(result_path),
-                                    str(converted_path),
-                                ]
-                                try:
-                                    subprocess.run(
-                                        ffmpeg_cmd,
-                                        check=True,
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL,
-                                        creationflags=subprocess.CREATE_NO_WINDOW
-                                        if os.name == "nt"
-                                        else 0,
-                                    )
-                                    logging.info(
-                                        f"Converted {result_path} to {converted_path}"
-                                    )
-                                    result_path.unlink()  # Remove original m4a
-                                    final_filename = converted_path.stem
-                                except Exception as e:
-                                    error_occurred = True
-                                    logging.error(
-                                        f"Error converting to {selected_format}: {e}"
-                                    )
-                                    finish_bar(False, error_msg=f"Convert Error: {e}")
-                                    return
-                            else:
-                                final_filename = result_path.stem
-                    except Exception as e:
-                        error_occurred = True
-                        logging.error(f"Error in conversion/tagging: {e}")
-                        finish_bar(False, error_msg=f"Tagging Error: {e}")
-                        return
-            except Exception as e:
-                error_occurred = True
-                logging.error(f"Error in conversion/tagging: {e}")
-                finish_bar(False, error_msg=f"Tagging Error: {e}")
-                return
-
-            update_progress(100)
-            if not error_occurred:
-                finish_bar(True, filename=final_filename)
-
-        threading.Thread(target=job, args=(url,), daemon=True).start()
-
-    def process_entry(self, entry, ydl, update_progress=None):
-        # video_id = entry.get("id")
-        downloaded_path = Path(str(ydl.prepare_filename(entry)))
+    def _process_entry(self, entry: dict, downloaded_path: Path, update_progress=None) -> Path | None:
         if not downloaded_path.exists():
-            raise Exception(
-                f"Expected file {downloaded_path} not found, skipping tagging."
-            )
+            raise FileNotFoundError(f"Expected file {downloaded_path} not found; tagging skipped.")
 
         uploader = entry.get("uploader", "Unknown").replace("/", "_")
         raw_title = entry.get("title", "Unknown").replace("/", "_")
@@ -374,81 +472,55 @@ class YouTubeDownloaderApp:
         title = title.replace("(Visual)", "").strip()
         title = title.strip(" -_?!.,;:()[]{}'\"\\")
 
-        # --- shazam recognition ---
-        logging.info("Identifying track via Shazam_IO...")
+        logging.info("Identifying track via ShazamIO…")
         if update_progress:
             update_progress(92)
 
-        # Convert to temporary MP3 for Shazam to avoid header issues
-        temp_mp3_path = downloaded_path.with_suffix(".temp.mp3")
+        temp_mp3 = downloaded_path.with_suffix(".temp.mp3")
+        result = {}
         try:
-            ffmpeg_cmd = [
-                FFMPEG_PATH,
-                "-y",  # Overwrite output file
-                "-i",
-                str(downloaded_path),
-                "-ss",
-                "30",  # Start at 30 seconds
-                "-t",
-                "40",  # Duration: 40 seconds (30-70s)
-                "-acodec",
-                "mp3",
-                "-ab",
-                "128k",  # Bitrate
-                str(temp_mp3_path),
-            ]
             subprocess.run(
-                ffmpeg_cmd,
+                [
+                    FFMPEG_PATH, "-y",
+                    "-i", str(downloaded_path),
+                    "-ss", "60", "-t", "30",
+                    "-acodec", "mp3", "-ab", "256k",
+                    str(temp_mp3),
+                ],
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                creationflags=CREATE_NO_WINDOW,
             )
-            logging.info(f"Created temporary MP3 for Shazam: {temp_mp3_path}")
-
-            # Use the temporary MP3 for recognition
-            result = recognize_track(str(temp_mp3_path))
-            if update_progress:
-                update_progress(96)
-
-        except Exception as e:
-            logging.warning(f"Shazam recognition failed: {e}")
-            if update_progress:
-                update_progress(96)
-            result = {}
+            result = recognize_track(str(temp_mp3))
+        except Exception as exc:
+            logging.warning(f"Shazam recognition failed: {exc}")
         finally:
-            # Clean up temporary MP3 file
-            if temp_mp3_path.exists():
+            if temp_mp3.exists():
                 try:
-                    temp_mp3_path.unlink()
-                    logging.info("Cleaned up temporary MP3 file")
-                except Exception as e:
-                    logging.warning(
-                        f"Could not delete temporary file {temp_mp3_path}: {e}"
-                    )
+                    temp_mp3.unlink()
+                except Exception as exc:
+                    logging.warning(f"Could not delete temp file {temp_mp3}: {exc}")
+
+        if update_progress:
+            update_progress(96)
 
         track_data = result.get("track", {})
+        if not track_data:
+            raise RuntimeError("Shazam returned no track info.")
+
         artist = track_data.get("subtitle", uploader)
         song_title = track_data.get("title", title)
         images = track_data.get("images", {})
         cover_url = images.get("coverart") or images.get("background")
 
-        # --- tagging ---
-        audio = MP4(str(downloaded_path))
-        audio.tags["\u00a9nam"] = [song_title]
-        audio.tags["\u00a9ART"] = [artist]
         album = ""
-        # If Shazam failed, make this a download error
-        if not result or "track" not in result or not result["track"]:
-            raise Exception("Shazam recognition failed: No track info returned.")
         year = entry.get("upload_date", "")[:4]
         genre = ""
-        genres_info = track_data.get("genres", {}).get("primary")
-        if genres_info:
-            genre = genres_info
-        sections = track_data.get("sections", [])
-        if sections and "metadata" in sections[0]:
-            for item in sections[0]["metadata"]:
+        if track_data.get("genres", {}).get("primary"):
+            genre = track_data["genres"]["primary"]
+        for section in track_data.get("sections", []):
+            for item in section.get("metadata", []):
                 key = item.get("title", "").lower()
                 text = item.get("text", "")
                 if key == "album":
@@ -457,42 +529,47 @@ class YouTubeDownloaderApp:
                     year = text.split("-")[0]
                 elif key == "genre":
                     genre = text
-        audio.tags["\u00a9alb"] = [album]
-        audio.tags["\u00a9day"] = [year]
-        audio.tags["\u00a9gen"] = [genre]
+
+        audio = MP4(str(downloaded_path))
+        audio.tags["\xa9nam"] = [song_title]
+        audio.tags["\xa9ART"] = [artist]
+        audio.tags["\xa9alb"] = [album]
+        audio.tags["\xa9day"] = [year]
+        audio.tags["\xa9gen"] = [genre]
         audio.tags["desc"] = [entry.get("description", "")]
         audio.tags["ldes"] = [entry.get("webpage_url", "")]
 
         if cover_url:
-            logging.info("Downloading cover art...")
+            logging.info("Downloading cover art…")
             try:
-                img_data = requests.get(cover_url).content
+                img_data = requests.get(cover_url, timeout=10).content
                 audio.tags["covr"] = [
                     MP4Cover(img_data, imageformat=MP4Cover.FORMAT_JPEG)
                 ]
-            except Exception as e:
-                logging.warning(f"Could not embed cover art: {e}")
+            except Exception as exc:
+                logging.warning(f"Could not embed cover art: {exc}")
 
         audio.save()
 
-        # --- rename inside same folder ---
         safe_artist = artist.replace("/", "_")
         safe_title = song_title.replace("/", "_")
         if "(" in safe_title and ")" not in safe_title:
             safe_title += ")"
-        new_name = f"{safe_artist} - {safe_title}.m4a"
-        new_path = downloaded_path.parent / new_name
+        new_path = downloaded_path.parent / f"{safe_artist} - {safe_title}.m4a"
 
         try:
             downloaded_path.rename(new_path)
-            logging.info(f"Downloaded and tagged: {new_path.relative_to(out_dir)}")
+            logging.info(f"Saved: {new_path.relative_to(out_dir)}")
             return new_path
-        except Exception as e:
-            logging.error(f"Could not rename {downloaded_path} -> {new_path}: {e}")
+        except Exception as exc:
+            logging.error(f"Rename failed {downloaded_path} → {new_path}: {exc}")
             return None
 
 
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = YouTubeDownloaderApp(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    window = YouTubeDownloaderApp()
+    window.show()
+    sys.exit(app.exec())

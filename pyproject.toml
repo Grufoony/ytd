@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "mutagen>=1.47.0",
+    "pyside6>=6.11.1",
     "requests>=2.34.2",
     "shazamio>=0.8.1",
     "yt-dlp>=2026.3.17",
